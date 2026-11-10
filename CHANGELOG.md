@@ -1,0 +1,48 @@
+# Changelog
+
+## 0.1.0
+
+The first release: a driver for the HC-SR04 ultrasonic ranging module on
+two GPIO pins and a timer.
+
+- `HcSr04`, the type a program builds from the board's GPIO and timer
+  handles and the numbers of the Trig and Echo pins, implementing
+  devices-nv's `Rangefinder`. `range_start` fires one measurement and
+  returns when the echo has been timed; `range_read` answers the distance
+  in millimetres with its status.
+- The measurement as functions over any `GpioOut` and `Timer`: the trigger
+  pulse of 12 µs, the Echo pulse timed by polling the pin and the
+  microsecond tick, the 38 ms cap that means no target, the 5 ms wait for
+  Echo to rise, and the wait for Echo to be low before a trigger.
+- The 60 ms measurement cycle, kept by the driver from the tick of the
+  last trigger.
+- The conversion of a pulse to millimetres at a speed of sound that is a
+  parameter, 343 m/s by default, and `set_temperature_milli_c`, which takes
+  the speed from the air's temperature (331.3 m/s plus 0.606 m/s a degree).
+- Statuses: `RangeValid` from 2 cm to 4 m, `RangeOutOfRange` outside it,
+  `RangeNoTarget` for a pulse of 38 ms or more, `RangeFault` for an Echo
+  line that is high and stays high, and no reading for a module that does
+  not raise Echo.
+- The device program `examples/range_reader.nv`, a distance reader. Built
+  for the nRF52840-DK it is 12,444 B of flash and for the nRF54LM20-DK
+  14,220 B.
+
+### Known
+
+- Hardware verification: NOT VERIFIED. No board on the bench carries the
+  module.
+- The specification read, "Ultrasonic Ranging Module HC-SR04" from
+  ElecFreaks, carries no document number and no revision. It does not give
+  the 38 ms no-echo pulse; that figure is from Zephyr's driver and the
+  modules' behaviour.
+- Not implemented: the awaited-edge form over `GpioInAsync`, because a
+  generic `async fn` that awaits a method of its bound does not build
+  (`bugs/language/a-generic-async-fn-that-awaits-a-bounded-trait-method-fails-monomorphization.md`
+  in the novo-lang repository), and input capture on a hardware timer,
+  which embedded-hal-nv has no trait for.
+- `devices-nv` is a path dependency (`../devices-nv`, 0.3.3), which has the
+  `Rangefinder` trait and is not on the registry yet. `embedded-hal-nv` is
+  the registry's 0.3.2, because a path copy of it conflicts with the
+  registry requirement of devices-nv.
+- The `[tier]` of the manifest is `embedded`, the strictest, so the module
+  also checks at `rt` and `system`.

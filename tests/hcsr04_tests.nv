@@ -1,0 +1,393 @@
+// hcsr04_tests — the driver over a double of the module: a clock that
+// every read of the timer advances, and an Echo pin whose level follows
+// the trigger the way the HC-SR04 sheet ("Ultrasonic Ranging Module
+// HC-SR04", ElecFreaks) describes: Trig high for at least 10 us, then a
+// burst, then Echo high for a time proportional to the distance.
+//
+// The double's state `st`, all in microseconds on its own clock:
+//   0   the clock                     1   Trig's level now
+//   2   when Trig last rose           3   when Trig last fell
+//   4   how many times Trig rose      5   the first Trig-high time that was too short
+//   10  Echo's delay after Trig falls 11  the pulse width Echo is high for
+//   12  1 when a module answers      13  1 when Echo is stuck high
+//   14  Echo is high until this time (the tail of an earlier pulse)
+//   20  when Echo rises (set by the trigger)   21  when Echo falls
+// `log` keeps the rise times of Trig, `pinmode` the direction of each pin
+// and the order the pins were driven in.
+
+use std.test
+use embedded_hal.{ BoardGpio, BoardTimer, GpioOut, Timer }
+use dev_range.{ RangeReading, RangeStatus, Rangefinder, range_has_distance }
+use hcsr04
+use hcsr04.{ HcSr04, HcState }
+
+struct World
+    st: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+    pinmode: HashMap<Int, Int>
+    order: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+fn world() -> World
+    let w = World { st: HashMap.new(), log: HashMap.new(), pinmode: HashMap.new(), order: HashMap.new() }
+    w.st.insert(10, 400)
+    w.st.insert(11, 5830)
+    w.st.insert(12, 1)
+    w
+
+// The clock and the delays.  Every read of the tick costs 1 us, as a
+// poll of a real timer does, so a wait always ends.
+struct FakeTimer
+    w: World
+
+impl Timer for FakeTimer
+    fn delay_ms(self, ms: Int) [hw]
+        self.w.st.insert(0, at(self.w.st, 0) + ms * 1000)
+
+    fn delay_us(self, us: Int) [hw]
+        self.w.st.insert(0, at(self.w.st, 0) + us)
+
+    fn ticks_ms(self) -> Int [hw]
+        at(self.w.st, 0) / 1000
+
+    fn ticks_us(self) -> Int [hw]
+        let n = at(self.w.st, 0) + 1
+        self.w.st.insert(0, n)
+        n
+
+// The pins: Trig is pin 3, Echo is pin 4.  A rising Trig records its
+// time; a falling Trig starts the burst, and if a module answers, Echo
+// rises `st[10]` us later and stays high `st[11]` us.
+struct FakePins
+    w: World
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.w.pinmode.insert(pin, dir)
+        let n = at(self.w.order, 0)
+        self.w.order.insert(n + 1, pin * 10 + dir)
+        self.w.order.insert(0, n + 1)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        let now = at(self.w.st, 0)
+        let n = at(self.w.order, 0)
+        self.w.order.insert(n + 1, pin * 10 + 100 + val)
+        self.w.order.insert(0, n + 1)
+        if pin != 3
+            return
+        if val == 1 and at(self.w.st, 1) == 0
+            self.w.st.insert(2, now)
+            self.w.log.insert(at(self.w.st, 4), now)
+            self.w.st.insert(4, at(self.w.st, 4) + 1)
+        if val == 0 and at(self.w.st, 1) == 1
+            self.w.st.insert(3, now)
+            if now - at(self.w.st, 2) < 10 and at(self.w.st, 5) == 0
+                self.w.st.insert(5, now - at(self.w.st, 2))
+            if at(self.w.st, 12) == 1
+                self.w.st.insert(20, now + at(self.w.st, 10))
+                self.w.st.insert(21, now + at(self.w.st, 10) + at(self.w.st, 11))
+        self.w.st.insert(1, val)
+
+    fn get(self, pin: Int) -> Int [hw]
+        let now = at(self.w.st, 0)
+        if at(self.w.st, 13) == 1
+            return 1
+        if now < at(self.w.st, 14)
+            return 1
+        if now >= at(self.w.st, 20) and now < at(self.w.st, 21)
+            return 1
+        0
+
+fn status_of(o: ?RangeReading) -> RangeStatus
+    match o
+        Some(r) => r.status
+        None    => RangeStatus.RangeFault
+
+fn mm_of(o: ?RangeReading) -> Int
+    match o
+        Some(r) => r.mm
+        None    => -99999
+
+fn abs(v: Int) -> Int
+    if v < 0
+        return 0 - v
+    v
+
+// ── Conversions ──────────────────────────────────────────────────────
+
+@test
+fn test_the_data_sheet_conversion_is_58_us_to_the_centimetre() [io, hw]
+    test.assert_eq(hcsr04.mm_of_echo_us(58, 343000), 10)
+    test.assert_eq(hcsr04.mm_of_echo_us(5830, 343000), 1000)
+    test.assert_eq(hcsr04.mm_of_echo_us(5882, 340000), 1000)
+    test.assert_eq(hcsr04.mm_of_echo_us(23324, 343000), 4000)
+
+@test
+fn test_a_pulse_or_a_speed_that_is_not_positive_is_no_distance() [io, hw]
+    test.assert_eq(hcsr04.mm_of_echo_us(0, 343000), 0)
+    test.assert_eq(hcsr04.mm_of_echo_us(-5, 343000), 0)
+    test.assert_eq(hcsr04.mm_of_echo_us(5830, 0), 0)
+    test.assert_eq(hcsr04.mm_of_echo_us(5830, -1), 0)
+
+@test
+fn test_the_speed_of_sound_follows_the_temperature() [io, hw]
+    test.assert_eq(hcsr04.speed_of_sound_mm_s(0), 331300)
+    test.assert_eq(hcsr04.speed_of_sound_mm_s(20000), 343420)
+    test.assert_eq(hcsr04.speed_of_sound_mm_s(-20000), 319180)
+    test.assert_eq(hcsr04.speed_of_sound_mm_s(35500), 352813)
+
+@test
+fn test_a_warm_room_reads_a_shorter_distance_than_the_default_speed() [io, hw]
+    let cold = hcsr04.mm_of_echo_us(5830, hcsr04.speed_of_sound_mm_s(0))
+    let warm = hcsr04.mm_of_echo_us(5830, hcsr04.speed_of_sound_mm_s(30000))
+    test.assert_eq(cold, 966)
+    test.assert_eq(warm, 1019)
+
+@test
+fn test_the_reading_of_a_pulse() [io, hw]
+    let v = hcsr04.reading_of(5830, 343000)
+    test.assert_eq(v.mm, 1000)
+    test.assert(v.status == RangeStatus.RangeValid)
+    test.assert(range_has_distance(v))
+    let edge_lo = hcsr04.reading_of(117, 343000)
+    test.assert_eq(edge_lo.mm, 20)
+    test.assert(edge_lo.status == RangeStatus.RangeValid)
+    let edge_hi = hcsr04.reading_of(23300, 343000)
+    test.assert_eq(edge_hi.mm, 3996)
+    test.assert(edge_hi.status == RangeStatus.RangeValid)
+
+@test
+fn test_a_pulse_outside_2_cm_to_4_m_is_out_of_range_with_no_distance() [io, hw]
+    let near = hcsr04.reading_of(100, 343000)
+    test.assert_eq(near.mm, 0)
+    test.assert(near.status == RangeStatus.RangeOutOfRange)
+    let far = hcsr04.reading_of(23400, 343000)
+    test.assert_eq(far.mm, 0)
+    test.assert(far.status == RangeStatus.RangeOutOfRange)
+    let zero = hcsr04.reading_of(0, 343000)
+    test.assert(zero.status == RangeStatus.RangeOutOfRange)
+    test.assert(not range_has_distance(zero))
+
+@test
+fn test_a_38_ms_pulse_is_no_target_and_a_stuck_line_is_a_fault() [io, hw]
+    let none = hcsr04.reading_of(38000, 343000)
+    test.assert_eq(none.mm, 0)
+    test.assert(none.status == RangeStatus.RangeNoTarget)
+    test.assert(hcsr04.reading_of(41000, 343000).status == RangeStatus.RangeNoTarget)
+    test.assert(hcsr04.reading_of(37999, 343000).status == RangeStatus.RangeOutOfRange)
+    let stuck = hcsr04.reading_of(-2, 343000)
+    test.assert_eq(stuck.mm, 0)
+    test.assert(stuck.status == RangeStatus.RangeFault)
+
+@test
+fn test_the_cycle_wait() [io, hw]
+    test.assert_eq(hcsr04.cycle_wait_us(100, -1), 0)
+    test.assert_eq(hcsr04.cycle_wait_us(10000, 0), 50000)
+    test.assert_eq(hcsr04.cycle_wait_us(60000, 0), 0)
+    test.assert_eq(hcsr04.cycle_wait_us(90000, 0), 0)
+    test.assert_eq(hcsr04.cycle_wait_us(50, 100), 60000)
+
+@test
+fn test_the_start_code() [io, hw]
+    test.assert_eq(hcsr04.start_code(5830), 0)
+    test.assert_eq(hcsr04.start_code(0), 0)
+    test.assert_eq(hcsr04.start_code(-1), -1)
+    test.assert_eq(hcsr04.start_code(-2), -2)
+
+// ── The pins and the timer ───────────────────────────────────────────
+
+@test
+fn test_wait_level_answers_the_tick_of_the_level_or_minus_one() [io, hw]
+    let w = world()
+    w.st.insert(20, 50)
+    w.st.insert(21, 200)
+    let t = FakeTimer { w: w }
+    let g = FakePins { w: w }
+    let seen = hcsr04.wait_level(g, t, 4, 1, 1000)
+    test.assert(seen >= 50 and seen <= 53)
+    let gone = hcsr04.wait_level(g, t, 4, 0, 1000)
+    test.assert(gone >= 200 and gone <= 203)
+    let w2 = world()
+    let miss = hcsr04.wait_level(FakePins { w: w2 }, FakeTimer { w: w2 }, 4, 1, 300)
+    test.assert_eq(miss, -1)
+    test.assert(at(w2.st, 0) >= 300)
+
+@test
+fn test_the_pins_are_set_up_with_trig_low_before_it_is_an_output() [io, hw]
+    let w = world()
+    hcsr04.pins_setup(FakePins { w: w }, 3, 4)
+    test.assert_eq(at(w.order, 0), 3)
+    test.assert_eq(at(w.order, 1), 100 + 30 + 0)
+    test.assert_eq(at(w.order, 2), 31)
+    test.assert_eq(at(w.order, 3), 40)
+    test.assert_eq(at(w.pinmode, 3), 1)
+    test.assert_eq(at(w.pinmode, 4), 0)
+
+// ── One measurement ──────────────────────────────────────────────────
+
+@test
+fn test_a_metre_measures_5830_us_to_within_the_poll() [io, hw]
+    let w = world()
+    let st = hcsr04.state_new()
+    var s = st
+    let width = hcsr04.measure(FakePins { w: w }, FakeTimer { w: w }, 3, 4, var s)
+    test.assert(abs(width - 5830) <= 3)
+    test.assert_eq(at(w.st, 4), 1)
+
+@test
+fn test_the_trigger_pulse_is_at_least_10_us() [io, hw]
+    let w = world()
+    var s = hcsr04.state_new()
+    let _ = hcsr04.measure(FakePins { w: w }, FakeTimer { w: w }, 3, 4, var s)
+    test.assert(at(w.st, 3) - at(w.st, 2) >= 12)
+    test.assert_eq(at(w.st, 5), 0)
+    test.assert_eq(at(w.st, 1), 0)
+
+@test
+fn test_a_module_that_raises_echo_late_is_still_timed_from_the_rise() [io, hw]
+    let w = world()
+    w.st.insert(10, 1500)
+    w.st.insert(11, 2915)
+    var s = hcsr04.state_new()
+    let width = hcsr04.measure(FakePins { w: w }, FakeTimer { w: w }, 3, 4, var s)
+    test.assert(abs(width - 2915) <= 3)
+
+@test
+fn test_no_target_is_a_pulse_of_38_ms_and_the_measurement_stops_there() [io, hw]
+    let w = world()
+    w.st.insert(11, 38200)
+    var s = hcsr04.state_new()
+    let width = hcsr04.measure(FakePins { w: w }, FakeTimer { w: w }, 3, 4, var s)
+    test.assert_eq(width, 38000)
+    test.assert(hcsr04.reading_of(width, 343000).status == RangeStatus.RangeNoTarget)
+
+@test
+fn test_a_pulse_that_falls_a_tick_after_38_ms_is_capped_at_38_ms() [io, hw]
+    let w = world()
+    w.st.insert(11, 38001)
+    var s = hcsr04.state_new()
+    let width = hcsr04.measure(FakePins { w: w }, FakeTimer { w: w }, 3, 4, var s)
+    test.assert_eq(width, 38000)
+
+@test
+fn test_a_pulse_just_under_38_ms_is_a_distance_out_of_range() [io, hw]
+    let w = world()
+    w.st.insert(11, 30000)
+    var s = hcsr04.state_new()
+    let width = hcsr04.measure(FakePins { w: w }, FakeTimer { w: w }, 3, 4, var s)
+    test.assert(abs(width - 30000) <= 3)
+    test.assert(hcsr04.reading_of(width, 343000).status == RangeStatus.RangeOutOfRange)
+
+@test
+fn test_a_module_that_does_not_raise_echo_is_absent_after_5_ms() [io, hw]
+    let w = world()
+    w.st.insert(12, 0)
+    var s = hcsr04.state_new()
+    let width = hcsr04.measure(FakePins { w: w }, FakeTimer { w: w }, 3, 4, var s)
+    test.assert_eq(width, -1)
+    test.assert(at(w.st, 0) >= 5000)
+    test.assert_eq(at(w.st, 4), 1)
+
+@test
+fn test_an_echo_line_stuck_high_is_a_fault_and_no_trigger_is_fired() [io, hw]
+    let w = world()
+    w.st.insert(13, 1)
+    var s = hcsr04.state_new()
+    let width = hcsr04.measure(FakePins { w: w }, FakeTimer { w: w }, 3, 4, var s)
+    test.assert_eq(width, -2)
+    test.assert_eq(at(w.st, 4), 0)
+    test.assert(at(w.st, 0) >= 50000)
+
+@test
+fn test_the_tail_of_the_last_pulse_is_waited_out_before_the_trigger() [io, hw]
+    let w = world()
+    w.st.insert(14, 20000)
+    var s = hcsr04.state_new()
+    let width = hcsr04.measure(FakePins { w: w }, FakeTimer { w: w }, 3, 4, var s)
+    test.assert(abs(width - 5830) <= 3)
+    test.assert(at(w.log, 0) >= 20000)
+
+@test
+fn test_the_next_trigger_comes_60_ms_after_the_last() [io, hw]
+    let w = world()
+    var s = hcsr04.state_new()
+    let g = FakePins { w: w }
+    let t = FakeTimer { w: w }
+    let _a = hcsr04.measure(g, t, 3, 4, var s)
+    let _b = hcsr04.measure(g, t, 3, 4, var s)
+    test.assert_eq(at(w.st, 4), 2)
+    test.assert(at(w.log, 1) - at(w.log, 0) >= 60000)
+    test.assert(at(w.log, 1) - at(w.log, 0) <= 60100)
+
+@test
+fn test_a_caller_slower_than_the_cycle_is_not_made_to_wait() [io, hw]
+    let w = world()
+    var s = hcsr04.state_new()
+    let g = FakePins { w: w }
+    let t = FakeTimer { w: w }
+    let _a = hcsr04.measure(g, t, 3, 4, var s)
+    t.delay_ms(200)
+    let _b = hcsr04.measure(g, t, 3, 4, var s)
+    test.assert(at(w.log, 1) - at(w.log, 0) < 210000)
+
+// ── The state ────────────────────────────────────────────────────────
+
+@test
+fn test_run_keeps_the_pulse_and_reading_read_converts_it() [io, hw]
+    let w = world()
+    var s = hcsr04.state_new()
+    test.assert(hcsr04.reading_read(s) == None)
+    let width = hcsr04.range_run(FakePins { w: w }, FakeTimer { w: w }, 3, 4, var s)
+    test.assert_eq(s.echo_us, width)
+    test.assert(s.last_trigger_us > 0)
+    test.assert_eq(s.speed_mm_s, 343000)
+    test.assert(abs(mm_of(hcsr04.reading_read(s)) - 1000) <= 1)
+
+@test
+fn test_a_module_that_did_not_answer_has_no_reading() [io, hw]
+    let w = world()
+    w.st.insert(12, 0)
+    var s = hcsr04.state_new()
+    let _ = hcsr04.range_run(FakePins { w: w }, FakeTimer { w: w }, 3, 4, var s)
+    test.assert(hcsr04.reading_read(s) == None)
+
+@test
+fn test_a_stuck_echo_reads_as_a_fault() [io, hw]
+    let w = world()
+    w.st.insert(13, 1)
+    var s = hcsr04.state_new()
+    let _ = hcsr04.range_run(FakePins { w: w }, FakeTimer { w: w }, 3, 4, var s)
+    test.assert(status_of(hcsr04.reading_read(s)) == RangeStatus.RangeFault)
+
+// ── The type over the host's board handles ───────────────────────────
+//
+// The host's pins read 0 and its timer runs, so a measurement finds no
+// echo after the 5 ms wait: the module does not answer.  This runs the
+// lines of the type that forward to the functions above.
+
+@test
+fn test_the_type_over_absent_hardware() [io, hw]
+    var d = HcSr04.attach(BoardGpio { id: 0 }, BoardTimer { id: 0 }, 3, 4)
+    d.begin()
+    test.assert_eq(d.speed_mm_s(), 343000)
+    test.assert_eq(d.echo_us(), -1)
+    test.assert(d.range_read() == None)
+    test.assert_eq(d.range_max_mm(), 4000)
+    test.assert_eq(d.range_start(), -1)
+    test.assert(d.range_read() == None)
+    test.assert(d.measure_now() == None)
+    test.assert(d.range_read_after(10, 20) == None)
+
+@test
+fn test_the_speed_is_set_directly_or_from_the_temperature() [io, hw]
+    var d = HcSr04.attach(BoardGpio { id: 0 }, BoardTimer { id: 0 }, 3, 4)
+    d.set_speed_mm_s(340000)
+    test.assert_eq(d.speed_mm_s(), 340000)
+    d.set_speed_mm_s(0)
+    test.assert_eq(d.speed_mm_s(), 340000)
+    d.set_speed_mm_s(-5)
+    test.assert_eq(d.speed_mm_s(), 340000)
+    d.set_temperature_milli_c(0)
+    test.assert_eq(d.speed_mm_s(), 331300)

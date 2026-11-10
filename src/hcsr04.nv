@@ -1,0 +1,308 @@
+// hcsr04 — the HC-SR04 ultrasonic ranging module, on two GPIO pins and a
+// timer, as devices-nv's `Rangefinder`.
+//
+// The facts below are from the module's specification, "Ultrasonic
+// Ranging Module HC-SR04" (ElecFreaks; the copy that could be fetched
+// carries no document number and no revision), and from the modules'
+// behaviour as the drivers read for this one meet it.  Where the two
+// differ, the site says which was taken.
+//
+// The module has four pins: VCC (5 V), Trig, Echo and GND.  A measurement
+// is (the sheet, "Product features" and "Timing diagram"):
+//
+//   1. The host drives Trig high for at least 10 us.
+//   2. The module sends a burst of eight 40 kHz pulses and raises Echo.
+//   3. Echo stays high until the burst comes back, or, with no target,
+//      for a fixed time: the distance is `high time x speed of sound / 2`.
+//   4. The sheet advises a measurement cycle of more than 60 ms, so that
+//      the trigger of one measurement does not meet the echo of the last.
+//
+// Its range is 2 cm to 4 m, its working frequency 40 Hz, its beam 15
+// degrees.  The sheet gives the conversion as `us / 58 = cm`, which is
+// 344 m/s, and as `high time x 340 m/s / 2`.
+//
+// What the sheet does not give, and this driver takes from the modules'
+// behaviour as Zephyr's `drivers/sensor/hc_sr04` and the `hc-sr04` Rust
+// crate (nordmoen) meet it:
+//
+//   - With no target the module holds Echo high for about 38 ms.  A pulse
+//     of 38 ms or more is "no target"; the driver stops timing at 38 ms.
+//     (Zephyr's binding times out at 10 ms by default, 1.5 m, and aborts
+//     the measurement there; the `hc-sr04` crate has no timeout at all and
+//     answers `WouldBlock` for ever when the module is missing.)
+//   - Echo rises some hundreds of microseconds after Trig falls (the burst
+//     takes 200 us).  The driver waits up to 5 ms for the rise and reports
+//     a module that does not answer when it does not come.
+//
+// Fixes kept from those drivers:
+//
+//   - A missing module or a loose Echo wire ends the measurement: Echo is
+//     waited for 5 ms and then the call answers that nothing answered.
+//
+//   - A trigger fired while Echo is still high from the last measurement
+//     is lost or measures the wrong pulse.  Zephyr's driver arms the
+//     edge interrupt and fires the trigger without looking at Echo, and
+//     leaves the interrupt armed when the echo times out.  Here the
+//     driver waits for Echo to be low before it triggers, and answers a
+//     fault when it stays high.
+//   - The 60 ms cycle is the driver's, not the caller's: the time of the
+//     last trigger is kept, and a measurement started sooner waits for the
+//     rest of the cycle.
+//   - The speed of sound is a parameter.  Zephyr's driver fixes it at
+//     171 mm/ms (343 m/s).  The speed in air moves about 0.6 m/s a
+//     degree, so the answer is wrong by 0.17 % a degree from 20 degrees C;
+//     `set_temperature_milli_c` corrects it.
+//
+// The echo is timed by polling Echo and reading the timer's microsecond
+// tick, because `embedded-hal-nv` has no input-capture trait.  The edges
+// are seen to within one poll, about a microsecond on a Cortex-M4 at
+// 64 MHz, which is 0.17 mm; the two edges carry the same delay, which
+// cancels in the width.
+
+use embedded_hal.{ BoardGpio, BoardTimer, GpioOut, Timer }
+use dev_range.{ RangeReading, RangeStatus, Rangefinder }
+
+// The trigger: low for 4 us first so that the rising edge is clean, then
+// high for 12 us.  The sheet asks for at least 10 us; a delay may run
+// short by a tick, so the driver asks for 12.
+let TRIGGER_LOW_US = 4
+let TRIGGER_HIGH_US = 12
+
+// The measurement cycle the sheet advises, more than 60 ms.
+let CYCLE_US = 60000
+
+// The Echo pulse of a module that sees no target.  A pulse of this
+// length or more is "no target".
+let NO_ECHO_US = 38000
+
+// How long Echo may take to rise after the trigger, and how long it may
+// stay high from the last measurement before a new trigger.  A module
+// that sees no target holds Echo for about 38 ms, so 50 ms is enough for
+// the tail of the last pulse.
+let RISE_TIMEOUT_US = 5000
+let DRAIN_TIMEOUT_US = 50000
+
+// The range the sheet gives, in millimetres.
+let MIN_MM = 20
+let MAX_MM = 4000
+
+// The speed of sound in air at 20 degrees C, 343.4 m/s rounded to the
+// 343 m/s of `dev_range.range_of_echo_us`, in millimetres a second.
+let SPEED_20C_MM_S = 343000
+
+// What `measure` answers besides a pulse width in microseconds: the
+// module did not raise Echo, or Echo was high and did not fall.
+let ECHO_ABSENT = -1
+let ECHO_STUCK = -2
+
+// The driver's state, which the board's type holds and the functions
+// take: the speed of sound in millimetres a second, the tick of the last
+// trigger (-1 before the first), and the last pulse width in microseconds
+// (`ECHO_ABSENT` before the first measurement).  A plain struct, so it
+// lives in the arena once and the functions change it through the
+// reference.
+pub @value
+struct HcState
+    speed_mm_s: Int
+    last_trigger_us: Int
+    echo_us: Int
+
+// A fresh state: 343 m/s, no trigger yet, no pulse.
+pub fn state_new() -> HcState
+    HcState { speed_mm_s: SPEED_20C_MM_S, last_trigger_us: -1, echo_us: ECHO_ABSENT }
+
+// ── Conversions ──────────────────────────────────────────────────────
+
+// The speed of sound in dry air, in millimetres a second, at a
+// temperature in thousandths of a degree Celsius: 331.3 m/s at 0 degrees
+// plus 0.606 m/s a degree, the usual linear fit.  The sheet gives no
+// temperature dependence.
+pub fn speed_of_sound_mm_s(temp_milli_c: Int) -> Int
+    331300 + 606 * temp_milli_c / 1000
+
+// The distance in millimetres of an echo pulse of `echo_us` microseconds
+// at `speed_mm_s`, rounded to the nearest: the sound goes out and back,
+// so the distance is half of the speed times the time.  A pulse that is
+// not positive answers 0.
+//
+// The sheet's `us / 58 = cm`: 58 us at 343 m/s is 9.95 mm, so 10 mm.
+pub fn mm_of_echo_us(echo_us: Int, speed_mm_s: Int) -> Int
+    if echo_us <= 0 or speed_mm_s <= 0
+        return 0
+    (echo_us * speed_mm_s + 1000000) / 2000000
+
+// The reading a pulse means.  `echo_us` is what `measure` answered:
+// `ECHO_STUCK` is a fault, 38 ms or more is no target, a distance under
+// 2 cm or over 4 m is out of range with no distance, and anything else
+// is valid.  A pulse for no answer (`ECHO_ABSENT`) has no reading, which
+// `reading_of` is not asked for.
+pub fn reading_of(echo_us: Int, speed_mm_s: Int) -> RangeReading
+    if echo_us == ECHO_STUCK
+        return RangeReading { mm: 0, status: RangeStatus.RangeFault }
+    if echo_us >= NO_ECHO_US
+        return RangeReading { mm: 0, status: RangeStatus.RangeNoTarget }
+    let mm = mm_of_echo_us(echo_us, speed_mm_s)
+    if mm < MIN_MM or mm > MAX_MM
+        return RangeReading { mm: 0, status: RangeStatus.RangeOutOfRange }
+    RangeReading { mm: mm, status: RangeStatus.RangeValid }
+
+// How long a measurement started now waits for the cycle: the rest of
+// 60 ms since the last trigger, 0 before the first trigger and when the
+// cycle is over.  A tick earlier than the last trigger means the timer
+// was reset, and the whole cycle is waited.
+pub fn cycle_wait_us(now_us: Int, last_trigger_us: Int) -> Int
+    if last_trigger_us < 0
+        return 0
+    let elapsed = now_us - last_trigger_us
+    if elapsed < 0
+        return CYCLE_US
+    if elapsed >= CYCLE_US
+        return 0
+    CYCLE_US - elapsed
+
+// ── The measurement ──────────────────────────────────────────────────
+
+// Waits for `pin` to read `level`, up to `timeout_us`: the timer's tick
+// at which the level was seen, or -1.  The pin is read and then the
+// timer, so the tick is not earlier than the level.
+pub fn wait_level<G: GpioOut, T: Timer>(g: G, t: T, pin: Int, level: Int, timeout_us: Int) -> Int [hw]
+    let start = t.ticks_us()
+    loop
+        let v = g.get(pin)
+        let now = t.ticks_us()
+        if v == level
+            return now
+        if now - start >= timeout_us
+            return -1
+
+// Makes the pins ready: Trig an output driven low, Echo an input.  The
+// trigger is driven before it is an output so that it never glitches
+// high.
+pub fn pins_setup<G: GpioOut>(g: G, trigger: Int, echo: Int) [hw]
+    g.set(trigger, 0)
+    g.mode(trigger, 1)
+    g.mode(echo, 0)
+
+// Fires one measurement and times the Echo pulse: the pulse in
+// microseconds, `NO_ECHO_US` when Echo was still high that long,
+// `ECHO_ABSENT` when it did not rise, `ECHO_STUCK` when it was high
+// before the trigger and did not fall.  The cycle is waited first.  The
+// state records the trigger's tick.
+pub fn measure<G: GpioOut, T: Timer>(g: G, t: T, trigger: Int, echo: Int, var st: HcState) -> Int [hw]
+    let wait = cycle_wait_us(t.ticks_us(), st.last_trigger_us)
+    if wait > 0
+        t.delay_us(wait)
+    if wait_level(g, t, echo, 0, DRAIN_TIMEOUT_US) < 0
+        return ECHO_STUCK
+    g.set(trigger, 0)
+    t.delay_us(TRIGGER_LOW_US)
+    st = HcState { speed_mm_s: st.speed_mm_s, last_trigger_us: t.ticks_us(), echo_us: st.echo_us }
+    g.set(trigger, 1)
+    t.delay_us(TRIGGER_HIGH_US)
+    g.set(trigger, 0)
+    let rise = wait_level(g, t, echo, 1, RISE_TIMEOUT_US)
+    if rise < 0
+        return ECHO_ABSENT
+    let fall = wait_level(g, t, echo, 0, NO_ECHO_US)
+    if fall < 0
+        return NO_ECHO_US
+    let width = fall - rise
+    if width > NO_ECHO_US
+        return NO_ECHO_US
+    width
+
+// Measures and keeps the pulse in the state: whether the module
+// answered.  The reading is `reading_read`.
+pub fn range_run<G: GpioOut, T: Timer>(g: G, t: T, trigger: Int, echo: Int, var st: HcState) -> Int [hw]
+    let w = measure(g, t, trigger, echo, var st)
+    st = HcState { speed_mm_s: st.speed_mm_s, last_trigger_us: st.last_trigger_us, echo_us: w }
+    w
+
+// The reading of the last measurement, or `None` when the module did
+// not answer or none was made.
+pub fn reading_read(st: HcState) -> ?RangeReading
+    if st.echo_us == ECHO_ABSENT
+        return None
+    Some(reading_of(st.echo_us, st.speed_mm_s))
+
+// What `range_start` answers for a pulse `w`: 0 when the measurement is
+// done, which it is when the call returns, and a negative value when the
+// module did not answer or Echo was stuck.
+pub fn start_code(w: Int) -> Int
+    if w < 0
+        return w
+    0
+
+// ── The module on a board's pins ─────────────────────────────────────
+
+// An HC-SR04 with Trig on the pin `trigger` and Echo on the pin `echo` of
+// the board's GPIO, timed by the board's timer.  A plain struct: it holds
+// its state, so it is built once.
+pub @value
+struct HcSr04
+    gpio: BoardGpio
+    timer: BoardTimer
+    trigger: Int
+    echo: Int
+    st: HcState
+
+// The module with another state, or another speed of sound.
+fn with_state(d: HcSr04, st: HcState) -> HcSr04
+    HcSr04 { gpio: d.gpio, timer: d.timer, trigger: d.trigger, echo: d.echo, st: st }
+
+fn with_speed(d: HcSr04, v: Int) -> HcSr04
+    with_state(d, HcState { speed_mm_s: v, last_trigger_us: d.st.last_trigger_us, echo_us: d.st.echo_us })
+
+impl HcSr04
+    // The module on two pins, as a program builds it.  Nothing is sent.
+    fn attach(gpio: BoardGpio, timer: BoardTimer, trigger: Int, echo: Int) -> HcSr04
+        HcSr04 { gpio: gpio, timer: timer, trigger: trigger, echo: echo, st: state_new() }
+
+    // Makes the pins ready: Trig an output driven low, Echo an input.
+    // The module needs no other start; it is ready 5 ms after its supply.
+    fn begin(self) [hw]
+        pins_setup(self.gpio, self.trigger, self.echo)
+
+    // The speed of sound in millimetres a second; a value that is not
+    // positive is ignored.
+    fn set_speed_mm_s(var self, v: Int)
+        if v > 0
+            self = with_speed(self, v)
+
+    // The air's temperature in thousandths of a degree Celsius, from
+    // which the speed of sound is taken.
+    fn set_temperature_milli_c(var self, t: Int)
+        self = with_speed(self, speed_of_sound_mm_s(t))
+
+    // The speed of sound in use.
+    fn speed_mm_s(self) -> Int
+        self.st.speed_mm_s
+
+    // The last Echo pulse in microseconds, or a negative `ECHO_` code.
+    fn echo_us(self) -> Int
+        self.st.echo_us
+
+    // One measurement: the reading, or `None` when the module did not
+    // answer.  Takes the time of the echo, up to 38 ms, and of the cycle.
+    fn measure_now(var self) -> ?RangeReading [hw]
+        var st = self.st
+        let _w = range_run(self.gpio, self.timer, self.trigger, self.echo, var st)
+        self = with_state(self, st)
+        reading_read(st)
+
+impl Rangefinder[hw] for HcSr04
+    // Fires a measurement and times its echo.  The echo has to be timed
+    // as it comes, so the measurement is done when the call returns and
+    // the answer is 0, the time still to wait; a negative answer is a
+    // module that did not answer or an Echo line that stays high.
+    fn range_start(var self) -> Int [hw]
+        var st = self.st
+        let w = range_run(self.gpio, self.timer, self.trigger, self.echo, var st)
+        self = with_state(self, st)
+        start_code(w)
+
+    fn range_read(self) -> ?RangeReading [hw]
+        reading_read(self.st)
+
+    fn range_max_mm(self) -> Int [hw]
+        MAX_MM

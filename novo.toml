@@ -1,0 +1,27 @@
+[package]
+name        = "hcsr04-nv"
+version     = "0.1.0"
+description = "A driver for the HC-SR04 ultrasonic ranging module on two GPIO pins and a timer: the 10 µs trigger pulse, the echo pulse timed in microseconds, the distance in millimetres at a speed of sound that is a parameter or is corrected for the air temperature, the 38 ms no-echo pulse and the 60 ms cycle, as devices-nv's Rangefinder."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["hc-sr04", "hcsr04", "ultrasonic", "rangefinder", "distance", "gpio", "sensor", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/hcsr04-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.0"
+
+# The package is checked at the embedded tier, the strictest one, so
+# every function in it is also valid at rt and system.
+[tier]
+tier = "embedded"
+
+[docs.pages]
+"README.md" = "Reading an HC-SR04 ultrasonic module from a device program"
+
+[dependencies]
+# The board's GPIO and timer handles, and the GpioOut, GpioInAsync and
+# Timer traits they implement.
+embedded-hal-nv = "^0.3.2"
+# The Rangefinder trait and the reading it answers.
+devices-nv      = { path = "../devices-nv" }

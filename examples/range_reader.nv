@@ -1,0 +1,83 @@
+/* range_reader.nv: a reading loop that prints the distance an HC-SR04
+ * ultrasonic module measures, ten times a second
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *          or make this file the main of a package that depends on
+ *          hcsr04-nv and run
+ *              novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The module is wired to two pins of the board's GPIO: Trig to pin 3
+ * (P0.03) and Echo to pin 4 (P0.04) on the nRF52840 DK, which are the
+ * header's A0 and A1.  The module runs on 5 V and its Echo pin drives
+ * 5 V: put a divider (1 k and 2 k) or a level shifter between Echo and
+ * the board, whose pins take at most VDD plus 0.3 V.  Trig takes 3.3 V.
+ * A line looks like
+ *
+ *     range 1000 mm
+ *     no target
+ *
+ * The program reads the module through devices-nv's Rangefinder trait:
+ * `range_start` fires one measurement, and `range_read` answers the
+ * distance with its status.  The driver keeps the 60 ms cycle itself, so
+ * the loop's delay is only the printing rate.
+ *
+ * Effects the program declares: [hw], for the GPIO, the UART and the
+ * timer.  It allocates nothing after it starts.
+ *
+ * Boards: the program builds for the nRF52840 DK and the nRF54LM20 DK.
+ * Pin numbers are the chip's own; the nRF54LM20 DK has other header
+ * pins, so set `TRIG` and `ECHO` to the ones the board's documentation
+ * names.  The module has not been read on a board.
+ */
+use embedded_hal.{ BoardGpio, BoardTimer }
+use dev_range.{ RangeStatus, RangeReading, Rangefinder }
+use hcsr04.{ HcSr04 }
+
+const TRIG = 3
+const ECHO = 4
+
+// Writes `n`, 0 or more, in decimal.  Formatting into a string would
+// allocate, which @tier(embedded) refuses, so each digit goes out as a
+// byte.  An Int has at most 19 decimal digits, which bounds both loops.
+@tier(embedded)
+fn digits(n: Int) [hw]
+    var div = 1
+    for _k in 0..18
+        if div <= n / 10
+            div = div * 10
+    for _k in 0..19
+        if div > 0
+            hal.uart.write_byte(48 + (n / div) % 10)
+            div = div / 10
+
+// Writes the line for a reading.
+@tier(embedded)
+fn report(r: RangeReading) [hw]
+    match r.status
+        RangeValid =>
+            hal.uart.write("range ")
+            digits(r.mm)
+            hal.uart.write(" mm\n")
+        RangeWeak => hal.uart.write("weak\n")
+        RangeOutOfRange => hal.uart.write("out of range\n")
+        RangeNoTarget => hal.uart.write("no target\n")
+        RangeFault => hal.uart.write("echo line stuck high\n")
+
+@tier(embedded)
+fn main() [hw]
+    bsp.board.init()
+    var sensor = HcSr04.attach(BoardGpio { id: 0 }, BoardTimer { id: 0 }, TRIG, ECHO)
+    sensor.begin()
+    // The module is ready 5 ms after its supply; waiting is the program's.
+    hal.timer.delay_ms(5)
+    while true
+        if sensor.range_start() < 0
+            hal.uart.write("no answer\n")
+        else
+            match sensor.range_read()
+                Some(r) => report(r)
+                None => hal.uart.write("no answer\n")
+        hal.timer.delay_ms(100)
