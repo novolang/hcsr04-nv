@@ -24,4 +24,4 @@ tier = "embedded"
 # Timer traits they implement.
 embedded-hal-nv = "^0.3.2"
 # The Rangefinder trait and the reading it answers.
-devices-nv      = { path = "../devices-nv" }
+devices-nv      = "^0.3.3"

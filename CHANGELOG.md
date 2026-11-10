@@ -10,7 +10,9 @@
   awaits builds, which the novo-lang repository fixes after 0.24.0.
 - The README has an Install section and the image sizes measured again;
   the sources are in canonical `novo fmt` form and `pulse_width` has a
-  test of its own.
+  test of its own. `devices-nv` is the registry range `^0.3.3` in the
+  manifest, the lock and the device build, so the package no longer names
+  a path.
 
 ## 0.1.0
 
