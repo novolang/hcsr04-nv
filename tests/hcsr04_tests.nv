@@ -16,7 +16,7 @@
 // and the order the pins were driven in.
 
 use std.test
-use embedded_hal.{ BoardGpio, BoardTimer, GpioOut, Timer }
+use embedded_hal.{ BoardGpio, BoardTimer, GpioInAsync, GpioOut, Timer }
 use dev_range.{ RangeReading, RangeStatus, Rangefinder, range_has_distance }
 use hcsr04
 use hcsr04.{ HcSr04 }
@@ -98,6 +98,22 @@ impl GpioOut for FakePins
             return 1
         if now >= at(self.w.st, 20) and now < at(self.w.st, 21)
             return 1
+        0
+
+// Echo's edges as a board that parks a task on them delivers them: the
+// task wakes at the rise `st[20]` and at the fall `st[21]`, and the number
+// of parks is `st[30]`.
+struct FakeEdges
+    w: World
+
+impl GpioInAsync for FakeEdges
+    @tier(rt)
+    async fn wait_for_edge(self, pin: Int, edge: Int) -> Int [hw]
+        self.w.st.insert(30, at(self.w.st, 30) + 1)
+        if edge == 0
+            self.w.st.insert(0, at(self.w.st, 20))
+            return 1
+        self.w.st.insert(0, at(self.w.st, 21))
         0
 
 fn status_of(o: ?RangeReading) -> RangeStatus
@@ -381,3 +397,34 @@ fn test_the_speed_is_set_directly_or_from_the_temperature() [io, hw]
     test.assert_eq(d.speed_mm_s(), 343000)
     test.assert_eq(hcsr04.with_speed(d, 300000).trigger, 3)
     test.assert_eq(hcsr04.with_speed(d, 300000).echo, 4)
+
+// ── The awaited-edge form ────────────────────────────────────────────
+
+fn pulse_world(rise_us: Int, width_us: Int) -> World
+    let w = world()
+    w.st.insert(20, rise_us)
+    w.st.insert(21, rise_us + width_us)
+    w
+
+@test
+fn test_the_awaited_edge_form_times_the_pulse_between_its_edges() [io, hw, async]
+    let w = pulse_world(1000, 5830)
+    let width = await hcsr04.echo_width_us(FakeEdges { w: w }, FakeTimer { w: w }, 4)
+    test.assert_eq(width, 5830)
+    // One park for each edge, and the pulse is the distance the sheet gives.
+    test.assert_eq(at(w.st, 30), 2)
+    let r = hcsr04.reading_of(width, 343000)
+    test.assert_eq(r.mm, 1000)
+    test.assert(r.status == RangeStatus.RangeValid)
+
+@test
+fn test_the_awaited_edge_form_ends_a_long_pulse_at_38_ms() [io, hw, async]
+    let w = pulse_world(0, 45000)
+    let width = await hcsr04.echo_width_us(FakeEdges { w: w }, FakeTimer { w: w }, 4)
+    test.assert_eq(width, 38000)
+    test.assert(hcsr04.reading_of(width, 343000).status == RangeStatus.RangeNoTarget)
+
+@test
+fn test_the_awaited_edge_form_keeps_a_pulse_of_exactly_38_ms() [io, hw, async]
+    let w = pulse_world(250, 38000)
+    test.assert_eq(await hcsr04.echo_width_us(FakeEdges { w: w }, FakeTimer { w: w }, 4), 38000)

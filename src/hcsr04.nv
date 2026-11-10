@@ -62,7 +62,7 @@
 // 64 MHz, which is 0.17 mm; the two edges carry the same delay, which
 // cancels in the width.
 
-use embedded_hal.{ BoardGpio, BoardTimer, GpioOut, Timer }
+use embedded_hal.{ BoardGpio, BoardTimer, GpioInAsync, GpioOut, Timer }
 use dev_range.{ RangeReading, RangeStatus, Rangefinder }
 
 // The trigger: low for 4 us first so that the rising edge is clean, then
@@ -178,6 +178,31 @@ pub fn pulse_width<G: GpioOut, T: Timer>(g: G, t: T, echo: Int, rise: Int) -> In
     if fall < 0
         return NO_ECHO_US
     let width = fall - rise
+    if width > NO_ECHO_US
+        return NO_ECHO_US
+    width
+
+// The function is `@tier(rt)`: the package is checked at the embedded
+// tier, which refuses an `async fn` that is not bounded with
+// `@static_state(N)` (E4002), and a generic one has no state struct to
+// bound, so this is the one function of the package that needs a task.
+// The polling `measure` above is the form for a device without one.
+//
+// The Echo pulse timed by its edges: the task parks until Echo rises,
+// reads the timer, parks until Echo falls, and the width is the timer's
+// advance, up to 38 ms.  The call spins on nothing between the edges, so
+// a task that runs beside it is not held up by the 38 ms of a missing
+// target.  `wait_for_edge` has no timeout, so a module that never raises
+// Echo parks the task for ever: the caller bounds the call with a
+// cancellation scope (SPEC section 11.10), or fires the trigger and
+// calls this only when `GpioOut` polling saw Echo rise.  The width a
+// wake-up adds to each edge is the same, and cancels.
+@tier(rt)
+pub async fn echo_width_us<I: GpioInAsync, T: Timer>(g: I, t: T, echo: Int) -> Int [hw, async]
+    await g.wait_for_edge(echo, 0)
+    let start = t.ticks_us()
+    await g.wait_for_edge(echo, 1)
+    let width = t.ticks_us() - start
     if width > NO_ECHO_US
         return NO_ECHO_US
     width

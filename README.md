@@ -142,7 +142,7 @@ That line is the usual linear fit, not the sheet's.
 
 | Module | What is in it |
 |---|---|
-| `hcsr04` | The type `HcSr04` that holds a board's pins, timer and speed of sound, the measurement as functions over any `GpioOut` and `Timer`, the conversions and the reading |
+| `hcsr04` | The type `HcSr04` that holds a board's pins, timer and speed of sound, the measurement as functions over any `GpioOut` and `Timer`, the awaited-edge form over `GpioInAsync`, the conversions and the reading |
 
 ## How to choose an entry point
 
@@ -215,17 +215,34 @@ The status of a reading follows `devices-nv`:
 
 NOT IMPLEMENTED:
 
-- The awaited-edge form. `GpioInAsync` of embedded-hal-nv parks a task
-  until an edge, which would time the pulse without polling. A generic
-  `async fn` that awaits a method of its bound does not build with the
-  toolchain this was written with: the filing is
-  `bugs/language/a-generic-async-fn-that-awaits-a-bounded-trait-method-fails-monomorphization.md`
-  in the novo-lang repository. No board implements `GpioInAsync` either.
-- The `RangefinderAsync` trait, for the same reason.
+- A board that implements `GpioInAsync`. The awaited-edge form below runs
+  over a double of the pin; no board of `embedded-hal-nv` parks a task on
+  an edge yet.
+- The `RangefinderAsync` trait, which `devices-nv` does not name.
 - Input capture on a hardware timer, which `embedded-hal-nv` has no trait
   for.
 - The 3-pin variant of the module, with Trig and Echo on one pin.
 - Averaging several pulses or rejecting outliers.
+
+## The awaited-edge form
+
+`hcsr04.echo_width_us(g, t, echo)` is an `async fn` over any
+`GpioInAsync` and `Timer`. It parks the task until Echo rises, reads the
+timer, parks until Echo falls and answers the timer's advance in
+microseconds, 38 ms at most. Nothing polls between the edges, so a task
+beside it runs while the module waits for the echo. The trigger is fired
+by the caller, with `pins_setup` and the `GpioOut` calls of `measure`.
+
+1. `wait_for_edge` has no timeout. A module that never raises Echo parks
+   the task for ever, so the caller bounds the call with a cancellation
+   scope, or fires the trigger and polls for the rise first.
+2. The function is declared `@tier(rt)`. The package is checked at the
+   embedded tier, which refuses an `async fn` unless its state is bounded
+   with `@static_state(N)`, and a generic `async fn` has no state struct to
+   bound. A device program with no task keeps the polling `measure`.
+3. A generic `async fn` has no state struct of its own. `core.rt.spawn_future`
+   of a call of it is refused (E2021); `await` of it from another
+   `async fn` runs it in place.
 
 ## Related packages
 
@@ -247,7 +264,9 @@ trigger pulse's length, the order in which the pins are driven, a pulse
 timed to within the poll, the 38 ms cap, a module that does not answer, an
 Echo that is stuck high and one that is still high from the last pulse,
 the 60 ms cycle between two triggers with and without the padding, a
-function over the trait called on a `let`, and the type over the host's
+function over the trait called on a `let`, the awaited-edge form over a
+double of `GpioInAsync` (the two edges, the 38 ms cap and the number of
+parks), and the type over the host's
 board handles. The suite covers every line of `src/`:
 
 ```sh
