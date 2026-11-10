@@ -7,25 +7,26 @@ two GPIO pins and a timer.
 
 - `HcSr04`, the type a program builds from the board's GPIO and timer
   handles and the numbers of the Trig and Echo pins, implementing
-  devices-nv's `Rangefinder`. `range_start` fires one measurement and
-  returns when the echo has been timed; `range_read` answers the distance
-  in millimetres with its status.
+  devices-nv's `Rangefinder`. The value keeps no state, so the trait's
+  methods take a plain `self`: `range_start` answers 0 and `range_read`
+  fires one measurement, times its echo and answers the distance in
+  millimetres with its status.
 - The measurement as functions over any `GpioOut` and `Timer`: the trigger
   pulse of 12 µs, the Echo pulse timed by polling the pin and the
   microsecond tick, the 38 ms cap that means no target, the 5 ms wait for
   Echo to rise, and the wait for Echo to be low before a trigger.
-- The 60 ms measurement cycle, kept by the driver from the tick of the
-  last trigger.
+- The 60 ms measurement cycle, waited out at the end of each measurement
+  from the tick of its trigger; `measure_fast` leaves it to the caller.
 - The conversion of a pulse to millimetres at a speed of sound that is a
-  parameter, 343 m/s by default, and `set_temperature_milli_c`, which takes
+  parameter, 343 m/s by default, and `with_temperature_milli_c`, which takes
   the speed from the air's temperature (331.3 m/s plus 0.606 m/s a degree).
 - Statuses: `RangeValid` from 2 cm to 4 m, `RangeOutOfRange` outside it,
   `RangeNoTarget` for a pulse of 38 ms or more, `RangeFault` for an Echo
   line that is high and stays high, and no reading for a module that does
   not raise Echo.
 - The device program `examples/range_reader.nv`, a distance reader. Built
-  for the nRF52840-DK it is 12,444 B of flash and for the nRF54LM20-DK
-  14,220 B.
+  for the nRF52840-DK it is 12,324 B of flash and for the nRF54LM20-DK
+  13,620 B.
 
 ### Known
 

@@ -61,7 +61,7 @@ fn report(r: RangeReading) [hw]
 @tier(embedded)
 fn main() [hw]
     bsp.board.init()
-    var sensor = HcSr04.attach(BoardGpio { id: 0 }, BoardTimer { id: 0 }, TRIG, ECHO)
+    let sensor = HcSr04.attach(BoardGpio { id: 0 }, BoardTimer { id: 0 }, TRIG, ECHO)
     sensor.begin()
     // The module is ready 5 ms after its supply; waiting is the program's.
     hal.timer.delay_ms(5)
@@ -88,14 +88,14 @@ probe-rs run --chip nRF52840_xxAA main.elf
 
 | Image | Flash | Of which program | RAM (`.data` and `.bss`) |
 |---|---|---|---|
-| `nrf52840-dk` | 12,444 B | 1,730 B | 2,616 B |
-| `nrf54lm20-dk` | 14,220 B | 2,514 B | 2,616 B |
+| `nrf52840-dk` | 12,324 B | 1,616 B | 2,616 B |
+| `nrf54lm20-dk` | 13,620 B | 1,922 B | 2,616 B |
 
 The numbers are from the build's memory report. Flash also holds the
 runtime, the compiler's support library and the program's tables. The
 arena, 65,536 B on both boards, is the runtime's heap and is reserved
 whether or not the program uses it; the driver allocates nothing in it.
-The driver's whole state is a `HcSr04` value of 56 bytes in the program's
+The driver's whole state is a `HcSr04` value of 40 bytes in the program's
 frame.
 
 The wiring: Trig to pin 3 and Echo to pin 4 (P0.03 and P0.04 on the
@@ -135,35 +135,37 @@ The driver takes the speed of sound as 343 m/s, the figure
 `dev_range.range_of_echo_us` uses, which differs by 0.9 % from the
 sheet's 340 m/s. The speed in air rises by about 0.6 m/s a degree, so a
 program that knows the air's temperature calls
-`set_temperature_milli_c`, which uses 331.3 m/s plus 0.606 m/s a degree.
+`with_temperature_milli_c`, which uses 331.3 m/s plus 0.606 m/s a degree.
 That line is the usual linear fit, not the sheet's.
 
 ## What the package contains
 
 | Module | What is in it |
 |---|---|
-| `hcsr04` | The type `HcSr04` that holds a board's pins and timer, the state `HcState`, the measurement as functions over any `GpioOut` and `Timer`, the conversions and the reading |
+| `hcsr04` | The type `HcSr04` that holds a board's pins, timer and speed of sound, the measurement as functions over any `GpioOut` and `Timer`, the conversions and the reading |
 
 ## How to choose an entry point
 
-A program builds one `HcSr04` with `HcSr04.attach` and keeps it in a
-`var`, because the driver's state (the time of the last trigger, the last
-pulse and the speed of sound) is replaced in the value.
+A program builds one `HcSr04` with `HcSr04.attach`. The value holds the
+pins, the timer and the speed of sound, and no state that a measurement
+changes, so the `Rangefinder` methods take a plain `self` and a function
+written against the trait can call them on a `let`.
 
 | Method | What it does |
 |---|---|
-| `attach(gpio, timer, trigger, echo)` | the module on two pins of the board's GPIO; nothing is sent |
+| `attach(gpio, timer, trigger, echo)` | the module on two pins of the board's GPIO, at 343 m/s; nothing is sent |
 | `begin()` | Trig an output driven low, Echo an input |
-| `range_start()` | `Rangefinder`: one measurement, done when the call returns; 0, or a negative value when the module did not answer or Echo stays high |
-| `range_read()` | `Rangefinder`: the last measurement as a distance and a status, `None` when the module did not answer or none was made |
+| `range_start()` | `Rangefinder`: 0; the module measures when it is read, so there is nothing to start |
+| `range_read()` | `Rangefinder`: one measurement, padded to the 60 ms cycle, as a distance and a status; `None` when the module did not raise Echo |
 | `range_max_mm()` | `Rangefinder`: 4000 |
-| `measure_now()` | a measurement and its reading in one call |
-| `set_speed_mm_s(v)`, `set_temperature_milli_c(t)` | the speed of sound, directly or from the air's temperature |
-| `speed_mm_s()`, `echo_us()` | the speed in use, and the last pulse in microseconds |
+| `measure_fast()` | one measurement that leaves the 60 ms cycle to the caller |
+| `echo_us()` | one padded measurement as the Echo pulse in microseconds, or a negative code: -1 no Echo, -2 Echo stuck high |
+| `with_speed_mm_s(v)`, `with_temperature_milli_c(t)` | a copy of the module that converts at another speed of sound, directly or from the air's temperature |
+| `speed_mm_s()` | the speed in use |
 
 A program that holds its own pins, or a test with a double of the pins and
 the timer, calls the module's functions: `hcsr04.measure(g, t, trigger,
-echo, var state)` answers the pulse in microseconds, and
+echo, pad)` answers the pulse in microseconds, and
 `hcsr04.reading_of(pulse, speed)` turns it into a reading.
 
 The status of a reading follows `devices-nv`:
@@ -180,13 +182,16 @@ The status of a reading follows `devices-nv`:
 
 1. The module is ready 5 ms after its supply. The program waits; the
    driver does not.
-2. `range_start` blocks. The echo has to be timed as it comes, so the
-   call spins until the Echo pin falls, up to 38 ms, and the measurement
-   is done when it returns. `range_start` answers 0 for that reason, and
+2. `range_read` blocks. The echo has to be timed as it comes, so the call
+   spins until the Echo pin falls, up to 38 ms, and then until the 60 ms
+   cycle is over. `range_start` answers 0 for that reason, and
    `range_read_after` of the trait accepts any wait.
-3. The driver waits out the 60 ms cycle. It records the tick of each
-   trigger, and a measurement started less than 60 ms after the last waits
-   for the rest. A caller slower than the cycle does not wait.
+3. The driver waits out the 60 ms cycle at the end of each measurement,
+   counted from the trigger, so a loop can read at once and no trigger
+   meets the echo of the last. The value keeps no state, so it cannot wait
+   at the start of the next measurement instead, which would not spend the
+   time of a caller who is slower than the cycle. A caller who keeps its
+   own spacing uses `measure_fast`.
 4. The driver does not trigger while Echo is high. A pulse from the last
    measurement that has not ended is waited for, up to 50 ms; an Echo that
    stays high is a `RangeFault` and no trigger is sent. Zephyr's driver
@@ -207,6 +212,8 @@ The status of a reading follows `devices-nv`:
    5 ms with no module.
 
 ## What is not included
+
+NOT IMPLEMENTED:
 
 - The awaited-edge form. `GpioInAsync` of embedded-hal-nv parks a task
   until an edge, which would time the pulse without polling. A generic
@@ -239,8 +246,9 @@ several temperatures, every status of a reading at its limits, the
 trigger pulse's length, the order in which the pins are driven, a pulse
 timed to within the poll, the 38 ms cap, a module that does not answer, an
 Echo that is stuck high and one that is still high from the last pulse,
-the 60 ms cycle between two triggers, and the type over the host's board
-handles. The suite covers every line of `src/`:
+the 60 ms cycle between two triggers with and without the padding, a
+function over the trait called on a `let`, and the type over the host's
+board handles. The suite covers every line of `src/`:
 
 ```sh
 NOVO=bin/novo bash tests/coverage.sh

@@ -20,9 +20,10 @@
  *     no target
  *
  * The program reads the module through devices-nv's Rangefinder trait:
- * `range_start` fires one measurement, and `range_read` answers the
- * distance with its status.  The driver keeps the 60 ms cycle itself, so
- * the loop's delay is only the printing rate.
+ * `range_start` has nothing to start, and `range_read` fires one
+ * measurement, times its echo and answers the distance with its status.
+ * The driver waits out the 60 ms cycle at the end of each measurement, so
+ * a loop can read at once; the 100 ms delay is only the printing rate.
  *
  * Effects the program declares: [hw], for the GPIO, the UART and the
  * timer.  It allocates nothing after it starts.
@@ -69,7 +70,7 @@ fn report(r: RangeReading) [hw]
 @tier(embedded)
 fn main() [hw]
     bsp.board.init()
-    var sensor = HcSr04.attach(BoardGpio { id: 0 }, BoardTimer { id: 0 }, TRIG, ECHO)
+    let sensor = HcSr04.attach(BoardGpio { id: 0 }, BoardTimer { id: 0 }, TRIG, ECHO)
     sensor.begin()
     // The module is ready 5 ms after its supply; waiting is the program's.
     hal.timer.delay_ms(5)
