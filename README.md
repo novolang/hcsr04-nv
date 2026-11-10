@@ -13,6 +13,20 @@ this module, so the driver has run only against a double of the pins and
 the timer, in the host suite. The device program below builds for the
 nRF52840 DK and the nRF54LM20 DK and has not been flashed.
 
+## Install
+
+```sh
+novo pkg add hcsr04-nv
+```
+
+The device program is `examples/range_reader.nv`. Make it the `main` of a
+package that depends on this one and build it for a board:
+
+```sh
+novo build --target=nrf52840-dk src/main.nv
+novo build --target=nrf54lm20-dk src/main.nv
+```
+
 ## The device program
 
 `examples/range_reader.nv` reads the module ten times a second and prints
@@ -42,21 +56,21 @@ fn digits(n: Int) [hw]
             div = div * 10
     for _k in 0..19
         if div > 0
-            hal.uart.write_byte(48 + (n / div) % 10)
+            hal.uart.write_byte(48 + n / div % 10)
             div = div / 10
 
 // Writes the line for a reading.
 @tier(embedded)
 fn report(r: RangeReading) [hw]
     match r.status
-        RangeValid =>
+        RangeValid      =>
             hal.uart.write("range ")
             digits(r.mm)
             hal.uart.write(" mm\n")
-        RangeWeak => hal.uart.write("weak\n")
+        RangeWeak       => hal.uart.write("weak\n")
         RangeOutOfRange => hal.uart.write("out of range\n")
-        RangeNoTarget => hal.uart.write("no target\n")
-        RangeFault => hal.uart.write("echo line stuck high\n")
+        RangeNoTarget   => hal.uart.write("no target\n")
+        RangeFault      => hal.uart.write("echo line stuck high\n")
 
 @tier(embedded)
 fn main() [hw]
@@ -71,7 +85,7 @@ fn main() [hw]
         else
             match sensor.range_read()
                 Some(r) => report(r)
-                None => hal.uart.write("no answer\n")
+                None    => hal.uart.write("no answer\n")
         hal.timer.delay_ms(100)
 ```
 
@@ -91,7 +105,10 @@ probe-rs run --chip nRF52840_xxAA main.elf
 | `nrf52840-dk` | 12,324 B | 1,616 B | 2,616 B |
 | `nrf54lm20-dk` | 13,620 B | 1,922 B | 2,616 B |
 
-The numbers are from the build's memory report. Flash also holds the
+The numbers are from the build's memory report, taken with the compiler
+and the board packages that carry the Nordic I2C and SPI blocks; they are
+the same as before those blocks, because the program reaches neither bus.
+Flash also holds the
 runtime, the compiler's support library and the program's tables. The
 arena, 65,536 B on both boards, is the runtime's heap and is reserved
 whether or not the program uses it; the driver allocates nothing in it.

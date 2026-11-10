@@ -234,6 +234,26 @@ fn test_the_pins_are_set_up_with_trig_low_before_it_is_an_output() [io, hw]
     test.assert_eq(at(w.pinmode, 3), 1)
     test.assert_eq(at(w.pinmode, 4), 0)
 
+@test
+fn test_pulse_width_times_an_echo_that_rose_until_it_falls_and_caps_at_38_ms() [io, hw]
+    // Echo high from tick 50 to tick 200: timed from the rise the caller names.
+    let w = world()
+    w.st.insert(20, 50)
+    w.st.insert(21, 200)
+    w.st.insert(0, 50)
+    let width = hcsr04.pulse_width(FakePins { w: w }, FakeTimer { w: w }, 4, 50)
+    test.assert(abs(width - 150) <= 3)
+    // Still high past 38 ms: the wait ends there and answers the cap.
+    let w2 = world()
+    w2.st.insert(20, 0)
+    w2.st.insert(21, 90000)
+    test.assert_eq(hcsr04.pulse_width(FakePins { w: w2 }, FakeTimer { w: w2 }, 4, 0), 38000)
+    // A fall seen a tick after 38 ms is the cap as well.
+    let w3 = world()
+    w3.st.insert(20, 0)
+    w3.st.insert(21, 38002)
+    test.assert_eq(hcsr04.pulse_width(FakePins { w: w3 }, FakeTimer { w: w3 }, 4, 0), 38000)
+
 // ── One measurement ──────────────────────────────────────────────────
 
 @test

@@ -7,8 +7,8 @@
 # scratch package that depends on this one by path, the way a program on
 # a device depends on it.  The boards are the Nordic nRF52840-DK and
 # nRF54LM20-DK.  Nothing is flashed.  The emulated board's image
-# (nrf52-qemu) is then run under QEMU, where no device answers on the
-# I2C bus, and its first line must be the program's refusal.
+# (nrf52-qemu) is then run under QEMU, where no module drives Echo, and
+# its first line must be the program's "no answer".
 #
 # Run from anywhere:  bash tests/device_build.sh
 set -uo pipefail

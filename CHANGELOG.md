@@ -8,6 +8,9 @@
   declared `@tier(rt)`, since the package's embedded tier refuses an
   `async fn`. It needs a toolchain in which a generic `async fn` that
   awaits builds, which the novo-lang repository fixes after 0.24.0.
+- The README has an Install section and the image sizes measured again;
+  the sources are in canonical `novo fmt` form and `pulse_width` has a
+  test of its own.
 
 ## 0.1.0
 

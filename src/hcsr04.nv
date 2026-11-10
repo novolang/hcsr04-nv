@@ -68,7 +68,7 @@ use dev_range.{ RangeReading, RangeStatus, Rangefinder }
 // The trigger: low for 4 us first so that the rising edge is clean, then
 // high for 12 us.  The sheet asks for at least 10 us; a delay may run
 // short by a tick, so the driver asks for 12.
-let TRIGGER_LOW_US = 4
+let TRIGGER_LOW_US  = 4
 let TRIGGER_HIGH_US = 12
 
 // The measurement cycle the sheet advises, more than 60 ms.
@@ -82,7 +82,7 @@ let NO_ECHO_US = 38000
 // stay high from the last measurement before a new trigger.  A module
 // that sees no target holds Echo for about 38 ms, so 50 ms is enough for
 // the tail of the last pulse.
-let RISE_TIMEOUT_US = 5000
+let RISE_TIMEOUT_US  = 5000
 let DRAIN_TIMEOUT_US = 50000
 
 // The range the sheet gives, in millimetres.
@@ -96,7 +96,7 @@ let SPEED_20C_MM_S = 343000
 // What `measure` answers besides a pulse width in microseconds: the
 // module did not raise Echo, or Echo was high and did not fall.
 let ECHO_ABSENT = -1
-let ECHO_STUCK = -2
+let ECHO_STUCK  = -2
 
 // ── Conversions ──────────────────────────────────────────────────────
 
@@ -152,7 +152,8 @@ pub fn cycle_wait_us(now_us: Int, last_trigger_us: Int) -> Int
 // Waits for `pin` to read `level`, up to `timeout_us`: the timer's tick
 // at which the level was seen, or -1.  The pin is read and then the
 // timer, so the tick is not earlier than the level.
-pub fn wait_level<G: GpioOut, T: Timer>(g: G, t: T, pin: Int, level: Int, timeout_us: Int) -> Int [hw]
+pub fn wait_level<G: GpioOut, T: Timer>(g: G, t: T, pin: Int, level: Int,
+                                        timeout_us: Int) -> Int [hw]
     let start = t.ticks_us()
     loop
         let v = g.get(pin)
@@ -197,8 +198,8 @@ pub fn pulse_width<G: GpioOut, T: Timer>(g: G, t: T, echo: Int, rise: Int) -> In
 // cancellation scope (SPEC section 11.10), or fires the trigger and
 // calls this only when `GpioOut` polling saw Echo rise.  The width a
 // wake-up adds to each edge is the same, and cancels.
-@tier(rt)
-pub async fn echo_width_us<I: GpioInAsync, T: Timer>(g: I, t: T, echo: Int) -> Int [hw, async]
+pub @tier(rt)
+async fn echo_width_us<I: GpioInAsync, T: Timer>(g: I, t: T, echo: Int) -> Int [hw, async]
     await g.wait_for_edge(echo, 0)
     let start = t.ticks_us()
     await g.wait_for_edge(echo, 1)
