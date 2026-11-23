@@ -1,6 +1,6 @@
 [package]
 name        = "hcsr04-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "A driver for the HC-SR04 ultrasonic ranging module on two GPIO pins and a timer: the 10 µs trigger pulse, the echo pulse timed in microseconds, the distance in millimetres at a speed of sound that is a parameter or is corrected for the air temperature, the 38 ms no-echo pulse and the 60 ms cycle, as devices-nv's Rangefinder."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -22,6 +22,6 @@ tier = "embedded"
 [dependencies]
 # The board's GPIO and timer handles, and the GpioOut, GpioInAsync and
 # Timer traits they implement.
-embedded-hal-nv = "^0.3.2"
+embedded-hal-nv = "^0.4.0"
 # The Rangefinder trait and the reading it answers.
-devices-nv      = "^0.3.3"
+devices-nv      = "^0.4.0"

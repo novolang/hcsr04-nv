@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 — 2026-11-23
+
+The package asks for embedded-hal-nv ^0.4.0 (was ^0.3.2) and devices-nv ^0.4.0 (was ^0.3.3), the minor of both trait packages that the other drivers and the board packages ask for, so one version of each serves a program that takes this package beside any of them.  Under the older ranges, a program that named this package and a driver on 0.4 stopped with "no version of 'embedded-hal-nv' satisfies every requirement".
+
+No signature of the package changed.  `examples/range_reader.nv` adds the `RangeBlinded` and `RangeSaturated` arms that devices-nv 0.4.0 gives `RangeStatus`.  The suite's double of an awaited edge is `@tier(app)`: the toolchain refuses an `@tier(rt)` function that calls a map's `insert` and `get`, and the suite did not build with the 0.26.1 toolchain before this change.
+
+The device program builds for the boards its README names, flash nrf52840-dk 8,420 B before and 8,388 B after; nrf54lm20-dk 9,724 B before and 9,692 B after; nrf52-qemu 8,768 B before and 8,880 B after.
+
 ## Unreleased
 
 - `echo_width_us`, the awaited-edge form: an `async fn` over any
